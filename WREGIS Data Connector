@@ -1,0 +1,417 @@
+"""
+WREGIS Data Connector
+Handles two data paths:
+  1. Public Active Generators report  (auto-download, no login)
+  2. Account-holder CSV exports       (manual download, parsed here)
+
+Produces RECRecord objects compatible with OregonRECPriceAssessor.
+"""
+
+import io
+import re
+import csv
+import time
+import logging
+import requests
+import pandas as pd
+from pathlib import Path
+from datetime import datetime, date
+from dataclasses import dataclass, field
+from typing import Optional
+
+# Import from your assessor module
+# from rec_assessor import RECRecord
+
+log = logging.getLogger(__name__)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+PUBLIC_GENERATORS_URL = (
+    "https://www.wecc.org/wecc-document/1136"   # redirects to Excel download
+)
+
+# Column name maps: WREGIS label -> our internal field
+# (header names can drift between report versions — normalise them)
+GENERATOR_COL_MAP = {
+    "unit id":                  "unit_id",
+    "unit name":                "unit_name",
+    "organization name":        "org_name",
+    "state":                    "state",
+    "county":                   "county",
+    "fuel type":                "technology",
+    "technology type":          "tech_type",
+    "commenced operation date": "cod",
+    "nameplate capacity (mw)":  "capacity_mw",
+    "eligibilities":            "eligibilities",
+}
+
+CERTIFICATE_COL_MAP = {
+    # Issuance / Active Certificate export
+    "certificate id":          "cert_id",
+    "unit id":                 "unit_id",
+    "vintage month":           "vintage_month",   # e.g. "2024-03"
+    "fuel type":               "technology",
+    "quantity (mwh)":          "volume_mwh",
+    "state of generation":     "state",
+    "status":                  "status",          # Active / Retired / Transferred
+    "transaction date":        "transaction_date",
+    "price ($/mwh)":           "price_usd",       # only in some broker exports
+    "eligibilities":           "eligibilities",
+}
+
+OREGON_ELIGIBILITY_TOKENS = {
+    "oregon rps",
+    "oregon book and claim",
+    "oregon",
+}
+
+# ── Helper utilities ──────────────────────────────────────────────────────────
+
+def _norm_col(col: str) -> str:
+    """Lowercase + collapse whitespace for fuzzy column matching."""
+    return re.sub(r"\s+", " ", col.strip().lower())
+
+
+def _map_columns(df: pd.DataFrame, col_map: dict) -> pd.DataFrame:
+    """Rename DataFrame columns using a normalised map; drop unmapped cols."""
+    norm = {_norm_col(c): c for c in df.columns}
+    rename = {}
+    for expected, internal in col_map.items():
+        if expected in norm:
+            rename[norm[expected]] = internal
+    df = df.rename(columns=rename)
+    keep = [v for v in col_map.values() if v in df.columns]
+    return df[keep]
+
+
+def _infer_technology(raw: str) -> str:
+    raw = raw.lower()
+    if "wind"      in raw: return "wind"
+    if "solar"     in raw: return "solar"
+    if "hydro"     in raw: return "hydro"
+    if "geo"       in raw: return "geothermal"
+    if "biomass"   in raw: return "biomass"
+    if "biogas"    in raw: return "biomass"
+    return raw.split()[0] if raw else "unknown"
+
+
+def _is_oregon_eligible(eligibilities: str) -> bool:
+    if not isinstance(eligibilities, str):
+        return False
+    lower = eligibilities.lower()
+    return any(tok in lower for tok in OREGON_ELIGIBILITY_TOKENS)
+
+# ── Dataclasses ───────────────────────────────────────────────────────────────
+
+@dataclass
+class GeneratorRecord:
+    """Static generator attributes from the public WREGIS report."""
+    unit_id:     str
+    unit_name:   str
+    org_name:    str
+    state:       str
+    technology:  str
+    capacity_mw: float
+    cod:         Optional[date]
+    eligibilities: str
+    oregon_eligible: bool = False
+
+@dataclass
+class CertificateRecord:
+    """A parsed row from a WREGIS certificate export CSV."""
+    unit_id:          str
+    vintage_year:     int
+    vintage_month:    str       # "YYYY-MM"
+    technology:       str
+    volume_mwh:       float
+    state:            str
+    status:           str
+    transaction_date: str
+    price_usd:        Optional[float] = None
+    cert_id:          str = ""
+    eligibilities:    str = ""
+    oregon_eligible:  bool = False
+
+# ── Main Connector Class ──────────────────────────────────────────────────────
+
+class WREGISConnector:
+    """
+    Fetch and parse WREGIS data.
+
+    Usage:
+        conn = WREGISConnector()
+
+        # Path 1 – public generator list (no login)
+        generators = conn.fetch_public_generators(state_filter="OR")
+
+        # Path 2 – parse your manually-downloaded account CSV
+        certs = conn.parse_certificate_export("my_wregis_export.csv")
+
+        # Convert to RECRecords for the assessor
+        rec_records = conn.to_rec_records(certs, generators)
+    """
+
+    def __init__(self, request_delay: float = 1.0):
+        self.delay = request_delay
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; WREGIS-connector/1.0)"
+        })
+
+    # ── Path 1: Public Generators Report ──────────────────────────────────────
+
+    def fetch_public_generators(
+        self,
+        state_filter: Optional[str] = "OR",
+        cache_path: Optional[Path] = None,
+    ) -> list[GeneratorRecord]:
+        """
+        Download and parse the WREGIS Active Generators public Excel report.
+
+        Args:
+            state_filter: Two-letter state code to filter on (e.g. "OR"). 
+                          Pass None to return all Western generators.
+            cache_path:   Optional path to save/load the Excel file locally,
+                          avoiding repeated downloads.
+        Returns:
+            List of GeneratorRecord objects.
+        """
+        xl_bytes = self._get_public_excel(cache_path)
+        return self._parse_generators_excel(xl_bytes, state_filter)
+
+    def _get_public_excel(self, cache_path: Optional[Path]) -> bytes:
+        if cache_path and cache_path.exists():
+            log.info("Loading cached public generators report: %s", cache_path)
+            return cache_path.read_bytes()
+
+        log.info("Downloading WREGIS public generators report …")
+        time.sleep(self.delay)
+        resp = self._session.get(PUBLIC_GENERATORS_URL, allow_redirects=True, timeout=30)
+        resp.raise_for_status()
+
+        # WECC may serve a redirect page rather than the file directly;
+        # look for an .xlsx href if the content-type isn't Excel.
+        ct = resp.headers.get("content-type", "")
+        if "spreadsheet" in ct or "excel" in ct or "octet-stream" in ct:
+            xl_bytes = resp.content
+        else:
+            # Try to find a direct .xlsx link in the page HTML
+            match = re.search(r'href="([^"]+\.xlsx?)"', resp.text, re.I)
+            if not match:
+                raise RuntimeError(
+                    "Could not locate Excel download link on WECC page. "
+                    "Download manually from https://www.wecc.org/wecc-document/1136 "
+                    "and pass the path via cache_path."
+                )
+            direct_url = match.group(1)
+            if not direct_url.startswith("http"):
+                direct_url = "https://www.wecc.org" + direct_url
+            time.sleep(self.delay)
+            r2 = self._session.get(direct_url, timeout=30)
+            r2.raise_for_status()
+            xl_bytes = r2.content
+
+        if cache_path:
+            cache_path.write_bytes(xl_bytes)
+            log.info("Saved public generators report to %s", cache_path)
+
+        return xl_bytes
+
+    def _parse_generators_excel(
+        self, xl_bytes: bytes, state_filter: Optional[str]
+    ) -> list[GeneratorRecord]:
+        df = pd.read_excel(io.BytesIO(xl_bytes), header=0)
+        df = _map_columns(df, GENERATOR_COL_MAP)
+
+        if state_filter and "state" in df.columns:
+            df = df[df["state"].str.upper() == state_filter.upper()]
+
+        records = []
+        for _, row in df.iterrows():
+            try:
+                cod = pd.to_datetime(row.get("cod"), errors="coerce")
+                cod = cod.date() if not pd.isnull(cod) else None
+                cap = float(row.get("capacity_mw", 0) or 0)
+                elig = str(row.get("eligibilities", ""))
+                rec = GeneratorRecord(
+                    unit_id=str(row.get("unit_id", "")),
+                    unit_name=str(row.get("unit_name", "")),
+                    org_name=str(row.get("org_name", "")),
+                    state=str(row.get("state", "")),
+                    technology=_infer_technology(str(row.get("technology", ""))),
+                    capacity_mw=cap,
+                    cod=cod,
+                    eligibilities=elig,
+                    oregon_eligible=_is_oregon_eligible(elig),
+                )
+                records.append(rec)
+            except Exception as e:
+                log.warning("Skipping generator row: %s", e)
+
+        log.info("Parsed %d generator records (state=%s)", len(records), state_filter)
+        return records
+
+    # ── Path 2: Account-holder Certificate Export CSV ─────────────────────────
+
+    def parse_certificate_export(
+        self,
+        path_or_content: "str | Path | bytes",
+        oregon_only: bool = True,
+        status_filter: Optional[list[str]] = None,  # e.g. ["Retired", "Active"]
+    ) -> list[CertificateRecord]:
+        """
+        Parse a WREGIS certificate export CSV (downloaded from your account).
+
+        Args:
+            path_or_content: File path, Path object, or raw CSV bytes.
+            oregon_only:     Filter to rows with Oregon eligibility flags.
+            status_filter:   Optional list of certificate statuses to keep.
+        Returns:
+            List of CertificateRecord objects.
+        """
+        if isinstance(path_or_content, (str, Path)):
+            raw = Path(path_or_content).read_bytes()
+        else:
+            raw = path_or_content
+
+        # Detect encoding (WREGIS uses UTF-8 but sometimes adds BOM)
+        text = raw.decode("utf-8-sig")
+        df = pd.read_csv(io.StringIO(text), dtype=str, low_memory=False)
+        df = _map_columns(df, CERTIFICATE_COL_MAP)
+
+        if status_filter and "status" in df.columns:
+            df = df[df["status"].isin(status_filter)]
+
+        records = []
+        for _, row in df.iterrows():
+            try:
+                vintage_month = str(row.get("vintage_month", "")).strip()
+                if not vintage_month or vintage_month == "nan":
+                    continue
+                # Support "YYYY-MM" or "MM/YYYY" formats
+                if "/" in vintage_month:
+                    m, y = vintage_month.split("/")
+                    vintage_month = f"{y.strip()}-{m.strip().zfill(2)}"
+                vintage_year = int(vintage_month[:4])
+
+                vol = row.get("volume_mwh")
+                volume_mwh = float(vol) if vol and vol != "nan" else 0.0
+
+                price_raw = row.get("price_usd")
+                price_usd = float(price_raw) if price_raw and price_raw != "nan" else None
+
+                elig = str(row.get("eligibilities", ""))
+                oregon_ok = _is_oregon_eligible(elig)
+                if oregon_only and not oregon_ok:
+                    continue
+
+                rec = CertificateRecord(
+                    cert_id=str(row.get("cert_id", "")),
+                    unit_id=str(row.get("unit_id", "")),
+                    vintage_year=vintage_year,
+                    vintage_month=vintage_month,
+                    technology=_infer_technology(str(row.get("technology", ""))),
+                    volume_mwh=volume_mwh,
+                    state=str(row.get("state", "")),
+                    status=str(row.get("status", "")),
+                    transaction_date=str(row.get("transaction_date", "")),
+                    price_usd=price_usd,
+                    eligibilities=elig,
+                    oregon_eligible=oregon_ok,
+                )
+                records.append(rec)
+            except Exception as e:
+                log.warning("Skipping certificate row: %s", e)
+
+        log.info("Parsed %d certificate records (oregon_only=%s)", len(records), oregon_only)
+        return records
+
+    # ── Bridge: CertificateRecord → RECRecord ─────────────────────────────────
+
+    def to_rec_records(
+        self,
+        certs: list[CertificateRecord],
+        generators: Optional[list[GeneratorRecord]] = None,
+    ) -> list:   # list[RECRecord] — import from rec_assessor
+        """
+        Convert CertificateRecords to RECRecords for the price assessor.
+        Optionally enriches with generator static data (org name, capacity).
+        """
+        from rec_assessor import RECRecord  # local import to keep connector standalone
+
+        gen_index = {g.unit_id: g for g in (generators or [])}
+        results = []
+
+        for c in certs:
+            gen = gen_index.get(c.unit_id)
+            rec = RECRecord(
+                source="wregis",
+                price_usd=c.price_usd or 0.0,   # 0 if not in export; enrich externally
+                vintage_year=c.vintage_year,
+                technology=c.technology,
+                region="Oregon" if c.oregon_eligible else c.state,
+                transaction_date=c.transaction_date or datetime.today().isoformat(),
+                volume_mwh=c.volume_mwh if c.volume_mwh > 0 else None,
+                certified=c.oregon_eligible,
+                notes=(
+                    f"status={c.status}; "
+                    f"org={gen.org_name if gen else 'unknown'}; "
+                    f"cert={c.cert_id}"
+                ),
+            )
+            results.append(rec)
+
+        return results
+
+    # ── Utility: summarise what was loaded ────────────────────────────────────
+
+    def summary(
+        self,
+        generators: list[GeneratorRecord],
+        certs: list[CertificateRecord],
+    ) -> None:
+        print("=" * 50)
+        print("  WREGIS Data Load Summary")
+        print("=" * 50)
+        print(f"  Generators loaded   : {len(generators)}")
+        or_gen = [g for g in generators if g.oregon_eligible]
+        print(f"  Oregon-eligible     : {len(or_gen)}")
+        techs = {}
+        for g in or_gen:
+            techs[g.technology] = techs.get(g.technology, 0) + 1
+        for tech, n in sorted(techs.items(), key=lambda x: -x[1]):
+            print(f"    {tech:<15} {n}")
+        print(f"\n  Certificate rows    : {len(certs)}")
+        vols = sum(c.volume_mwh for c in certs)
+        print(f"  Total volume (MWh)  : {vols:,.0f}")
+        yrs = sorted({c.vintage_year for c in certs})
+        print(f"  Vintage years       : {yrs}")
+        print("=" * 50)
+
+
+# ── Example Usage ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    conn = WREGISConnector()
+
+    # --- Path 1: Public generators report ---
+    generators = conn.fetch_public_generators(
+        state_filter="OR",
+        cache_path=Path("wregis_generators_cache.xlsx"),  # avoids re-downloading
+    )
+
+    # --- Path 2: Your account export CSV ---
+    # Download from WREGIS > Reports > Certificate Reports > Export to CSV
+    # then point the path here:
+    certs = conn.parse_certificate_export(
+        path_or_content="wregis_certificate_export.csv",
+        oregon_only=True,
+        status_filter=["Active", "Retired"],
+    )
+
+    conn.summary(generators, certs)
+
+    # --- Bridge to assessor ---
+    rec_records = conn.to_rec_records(certs, generators)
+    print(f"\nConverted {len(rec_records)} records ready for OregonRECPriceAssessor")
